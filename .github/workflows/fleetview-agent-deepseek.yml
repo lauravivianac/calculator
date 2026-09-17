@@ -1,0 +1,511 @@
+name: FleetView agent task (DeepSeek)
+
+# Provisioned by FleetView. Dispatched from Direct dispatch in Live tasks when DeepSeek is
+# selected as the provider — each run is one agent task, given as a plain-language prompt.
+#
+# This runs the same anthropics/claude-code-action@v1 as the Claude workflow, pointed at
+# DeepSeek's Anthropic-compatible endpoint. See the comment above DEEPSEEK_SECRET_NAME in
+# lib/workflow-template.js for which configurations were tried and which one this is.
+#
+# Requires a DEEPSEEK_API_KEY secret on this repo (Settings → Secrets and variables →
+# Actions). Without it this workflow fails at the Run Claude Code step.
+#
+# Cost: DeepSeek is metered per token, not flat-rate like a Local subscription. FleetView
+# prices these runs itself from their token counts (lib/pricing.js) rather than trusting the
+# figure the CLI prints, which is computed off its own table and is several times wrong for a
+# model it does not recognise.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "What to ask the team to do"
+        required: true
+        type: string
+      # Assigned by the head who convened the work — they are the one who knows whether a task
+      # in their area is a rename or a migration. Optional, and an empty value falls back to the
+      # model this workflow used before the input existed, so an older console that sends none,
+      # and a manual run from the Actions tab, both behave exactly as they did.
+      model:
+        description: "Model to run on (blank = this workflow's default)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  run-agent-task:
+    runs-on: ubuntu-latest
+    steps:
+      # persist-credentials: false keeps this job's own GITHUB_TOKEN out of .git/config, where
+      # the agent could read it with a single git config call and push past the pull request
+      # this workflow exists to open. The agent step supplies its own credential for the work it
+      # does, and the pull-request step below pushes with an explicit URL, so nothing needs the
+      # persisted one.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Written to RUNNER_TEMP rather than the checkout so the agent can never see it as an
+      # untracked file and sweep it into a commit. It holds no secret — the key travels through
+      # the action's own input below — but a stray config file in a pull request is still noise.
+      - name: Point Claude Code at DeepSeek
+        id: settings
+        run: |
+          FILE="$RUNNER_TEMP/deepseek-settings.json"
+          jq -n \
+            --arg base "https://api.deepseek.com/anthropic" \
+            --arg model "${{ inputs.model || 'deepseek-v4-pro[1m]' }}" \
+            --arg small "deepseek-v4-flash" \
+            '{env: {
+                ANTHROPIC_BASE_URL: $base,
+                ANTHROPIC_MODEL: $model,
+                ANTHROPIC_DEFAULT_OPUS_MODEL: $model,
+                ANTHROPIC_DEFAULT_SONNET_MODEL: $model,
+                ANTHROPIC_DEFAULT_HAIKU_MODEL: $small,
+                CLAUDE_CODE_SUBAGENT_MODEL: $small
+            }}' > "$FILE"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          cat "$FILE"
+
+      - name: Run Claude Code against DeepSeek
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          settings: ${{ steps.settings.outputs.file }}
+          # No --model here on purpose: ANTHROPIC_MODEL in the settings file above already
+          # selects the model, and the probe confirmed it takes effect — the CLI's own init
+          # line reported the DeepSeek model. Passing both would be two sources of truth. The
+          # permission flags are the same CLI's, not Anthropic's, so they apply here identically.
+          claude_args: |
+            --allowedTools "Read,Glob,Grep,Edit,Write,NotebookEdit,TodoWrite,Task,Bash(npm test:*),Bash(npm run:*),Bash(npm ci:*),Bash(node --test:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*)"
+          #
+          # The prompt below asks for a pull request. The probe ran read-only and never
+          # exercised commit-and-open-a-PR against DeepSeek, so that path is unverified for
+          # this provider too.
+          #
+          # No track_progress: the action rejects it on workflow_dispatch whatever the
+          # provider — it needs an issue or PR to anchor its status comment to, and a dispatch
+          # has neither. It was here mirroring the Claude dispatch workflow, which turned out
+          # to be mirroring a mistake.
+          prompt: |
+            ${{ github.event.inputs.task }}
+
+            This task runs unattended. Nobody is reading a question you ask, and there is no
+            way to send you an answer — asking one does not pause the work, it ends the run
+            with nothing done. So do not ask a clarifying question and do not stop to request
+            confirmation. If the request is ambiguous, choose the most reasonable reading, say
+            in one line which reading you chose, and complete the work under it. If part of it
+            is impossible, finish everything else and say what you left undone and why.
+
+            Make your changes in the working tree and stop there. Do NOT commit, push, or
+            open a pull request yourself — the workflow does that with whatever you leave
+            behind, so anything you write is captured even if you run out of turns. Nothing
+            merges automatically; a human, or FleetView's certification step, reviews it.
+
+      - name: Open a pull request with whatever changed
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TASK: ${{ github.event.inputs.task }}
+          AGENT_OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No file changes in the working tree — nothing to open a pull request for."
+            exit 0
+          fi
+
+          # The branch is built on the base branch as it stands NOW, and carries no workflow
+          # changes. Both parts are needed, and both were learned the hard way.
+          #
+          # GitHub refuses a push from an Actions token that creates or updates any file under
+          # .github/workflows. The permissions block above cannot grant this: there is no
+          # workflows scope for GITHUB_TOKEN, so no configuration makes such a push legal.
+          #
+          # And the rejection is not limited to files the agent touched. Run 32496080056 was
+          # refused over fleetview-agent-deepseek.yml, which its agent never opened: the base
+          # branch simply moved on during the eight minutes the agent worked, so the branch
+          # carried a stale copy of a workflow and that was enough. The run before it, same
+          # code, same workflow, pushed fine — its base had not moved. Any dispatch long enough
+          # to overlap someone else landing a workflow change hits this.
+          #
+          # So: drop workflow edits, then rebuild the branch from the current base tip and
+          # replay the agent work onto it. Dropping is never silent — a change that vanishes
+          # without a word is worse than one refused out loud — so it is named here and in the
+          # pull request body.
+          # One authenticated URL, used for every git operation that touches the network.
+          #
+          # The checkout above runs with persist-credentials: false so the agent cannot read a
+          # token out of .git/config, which means origin has no credentials attached to it.
+          # Fetching from it fails outright:
+          #
+          #   remote: Invalid username or token. Password authentication is not supported.
+          #   fatal: Authentication failed for https://github.com/OWNER/REPO.git/
+          #
+          # That is exit 128 on the first network call, before any of the logic below runs — so
+          # the run reported nothing about what it had done. The push had already been converted
+          # to an explicit URL; the fetch was added later and still said origin.
+          #
+          # GH_TOKEN is a registered secret, so it is masked if it ever surfaces in a log, and
+          # nothing here writes it to disk.
+          REMOTE="https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
+
+          BASE_SHA="$(git rev-parse HEAD)"
+          echo "::group::Building the branch"
+          git fetch --no-tags --depth=1 "$REMOTE" "${GITHUB_REF_NAME}"
+          echo "fetched ${GITHUB_REF_NAME}"
+
+          DROPPED="$(git status --porcelain -- .github/workflows | sed 's/^...//')"
+          if [ -n "$DROPPED" ]; then
+            echo "An Actions token cannot push workflow files. Dropping these edits:"
+            printf '%s\n' "$DROPPED"
+            git checkout -- .github/workflows 2>/dev/null || true
+            git clean -fdq .github/workflows 2>/dev/null || true
+          fi
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "The only changes were under .github/workflows, which this token cannot push."
+            exit 0
+          fi
+
+          # Run id alone is not unique: re-running a failed job keeps it, so the branch would
+          # already exist and checkout -b would fail before anything was saved. The attempt
+          # number makes each try its own branch.
+          BRANCH="fleetview/task-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git config user.name "FleetView agent"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Replay onto the current base tip rather than the commit this run checked out, so
+          # the branch's workflow files match the base and nothing about them reads as a change.
+          STALE_BASE=""
+          git stash push --include-untracked --quiet
+          git checkout --quiet -B "$BRANCH" FETCH_HEAD
+          if ! git stash pop --quiet; then
+            # The base moved under this run and touched the same lines. Do not pick a side and
+            # do not throw the work away — a dispatch that cost real money and produced real
+            # edits must still arrive somewhere a human can look at it. Rebuild on the commit
+            # this run actually checked out, where the work applies cleanly by construction,
+            # and let the pull request show the conflict against the newer base.
+            echo "The base branch moved under this run and conflicts with the agent work:"
+            git diff --name-only --diff-filter=U
+            echo "Opening the pull request against the commit this run checked out instead."
+            # A conflicted pop leaves the stash entry in place but has already written the
+            # untracked files out, so popping again would collide with them. Reset tracked
+            # files, remove what the failed pop left behind, and apply the stash cleanly.
+            git checkout --quiet -f -B "$BRANCH" "$BASE_SHA"
+            git clean -fdq
+            git stash pop --quiet
+            STALE_BASE=1
+          fi
+          git add -A
+          echo "branch $BRANCH built on $(git rev-parse --short HEAD)"
+
+          # The task is written to a file and passed with -F, so no part of it is ever parsed
+          # by the shell or by git as an option.
+          {
+            printf '%s\n' "FleetView agent task"
+            printf '%s\n' ""
+            printf '%s\n' "$TASK"
+            printf '%s\n' ""
+            printf '%s\n' "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > /tmp/fleetview-commit-msg
+          git commit -F /tmp/fleetview-commit-msg
+
+          # Push to an explicit authenticated URL rather than to origin.
+          #
+          # Two reasons, and the first is correctness, not hygiene. The agent step rewrites
+          # origin to carry its own short-lived GitHub App token (its log says "Updated remote
+          # URL with authentication token") and then revokes that token in its own cleanup,
+          # which runs BEFORE this step. So by the time we get here origin is pointing at a
+          # dead credential. This push had never actually been exercised — every run so far
+          # stopped at the empty-working-tree check above — so that was waiting to be the next
+          # thing to fail after everything else was fixed.
+          #
+          # The second reason is that nothing is written to .git/config, so no token is left on
+          # disk. GH_TOKEN is a registered secret and is masked in the log if it ever surfaces.
+          git push "$REMOTE" "HEAD:refs/heads/$BRANCH"
+          echo "pushed $BRANCH"
+          echo "::endgroup::"
+
+          TITLE="FleetView agent task"
+          if [ "$AGENT_OUTCOME" != "success" ]; then
+            TITLE="[incomplete] FleetView agent task"
+          fi
+
+          {
+            printf '%s\n' "Opened by FleetView's dispatch workflow from run ${GITHUB_RUN_ID}."
+            printf '%s\n' ""
+            if [ "$AGENT_OUTCOME" != "success" ]; then
+              printf '%s\n' "**The agent step did not finish successfully** (outcome: ${AGENT_OUTCOME})."
+              printf '%s\n' "These changes are whatever it had written when it stopped. Read them before trusting them."
+              printf '%s\n' ""
+            fi
+            if [ -n "$STALE_BASE" ]; then
+              printf '%s\n' "**This branch is based on ${BASE_SHA}, not on the current tip of ${GITHUB_REF_NAME}.**"
+              printf '%s\n' "The base moved while the agent was working and the two changed the same lines,"
+              printf '%s\n' "so merging them automatically would have meant picking a side. Resolve it here."
+              printf '%s\n' ""
+            fi
+            if [ -n "$DROPPED" ]; then
+              printf '%s\n' "**Changes under .github/workflows were dropped from this branch.**"
+              printf '%s\n' "An Actions token cannot push workflow files, so they were reset to the base branch:"
+              printf '%s\n' ""
+              printf '%s\n' "$DROPPED" | sed 's/^/- /'
+              printf '%s\n' ""
+            fi
+            printf '%s\n' "### The task, as dispatched"
+            printf '%s\n' ""
+            printf '%s\n' "$TASK"
+            printf '%s\n' ""
+            printf '%s\n' "Nothing merges from here — review, QA and certification happen on this pull request."
+          } > /tmp/fleetview-pr-body
+
+          gh pr create \
+            --base "${GITHUB_REF_NAME}" \
+            --head "$BRANCH" \
+            --title "$TITLE" \
+            --body-file /tmp/fleetview-pr-body
+
+      - name: Report usage
+        if: always()
+        env:
+          FLEETVIEW_CREDENTIAL: api-key
+        run: |
+          FILE="${{ steps.claude.outputs.execution_file }}"
+          if [ -n "$FILE" ] && [ -f "$FILE" ]; then
+            node -e '
+              const fs = require("fs");
+              const path = process.argv[1];
+
+              // The CLI has written this file in two different shapes across versions: one
+              // JSON object per line, and a single pretty-printed JSON array. Handle both.
+              // Assuming JSONL is not harmless — against an array, every per-line parse fails,
+              // the whole-file fallback yields the ARRAY itself, and entry.usage is
+              // undefined, so the step reports nulls and Token usage shows "no data" for a run
+              // that cost real money. That was live behaviour until this was fixed.
+              //
+              // The newline is built with fromCharCode rather than written as an escape: this
+              // script passes through a JS template literal, then YAML, then a single-quoted
+              // shell node -e, and a backslash escape does not reliably survive all three.
+              const NL = String.fromCharCode(10);
+              let entries = [];
+              let raw = "";
+              try {
+                raw = fs.readFileSync(path, "utf8");
+              } catch (e) {
+                console.log("FLEETVIEW_USAGE_JSON={}");
+                console.log("FLEETVIEW_TRACE_JSON={}");
+                process.exit(0);
+              }
+              try {
+                const whole = JSON.parse(raw);
+                if (Array.isArray(whole)) entries = whole;
+                else if (whole && typeof whole === "object") entries = [whole];
+              } catch (e) {
+                // Not one JSON value, so treat it as JSONL and skip unparseable lines.
+                for (const line of raw.split(NL)) {
+                  if (!line.trim()) continue;
+                  try { entries.push(JSON.parse(line)); } catch (e2) { /* partial line */ }
+                }
+              }
+
+              // Scan from the end: the type:"result" entry is the last one written.
+              let entry = null;
+              for (let i = entries.length - 1; i >= 0 && !entry; i--) {
+                if (entries[i] && entries[i].type === "result") entry = entries[i];
+              }
+              if (!entry) entry = entries[entries.length - 1] || {};
+
+              const usage = entry.usage || {};
+
+              // Per-model token counts, which is what FleetView prices a run from. The CLI also
+              // prints its own total_cost_usd, carried through as reported_cost_usd — named for
+              // what it is, one claim from one provider tool, not a fact. It is only trustworthy when
+              // the CLI and the biller are the same organisation; pointed at a third-party
+              // endpoint it keeps pricing off its own table against a model name it does not
+              // know. See lib/pricing.js, which decides what FleetView is willing to claim.
+              const modelUsage = {};
+              for (const [model, raw] of Object.entries(entry.modelUsage || {})) {
+                // Guard the VALUE, not just the container. A null here threw a TypeError, the
+                // step exited non-zero under bash -e, and the whole job went red even when the
+                // agent had finished its work and opened its pull request -- taking both
+                // marker lines with it. if: always() does not save a step that throws.
+                const counts = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+                modelUsage[model] = {
+                  inputTokens: counts.inputTokens ?? null,
+                  outputTokens: counts.outputTokens ?? null,
+                  cacheReadInputTokens: counts.cacheReadInputTokens ?? null,
+                  cacheCreationInputTokens: counts.cacheCreationInputTokens ?? null,
+                };
+              }
+
+              const usageOut = {
+                provider: "deepseek",
+                // WHO SERVED IT is provider; WHO PAID is this. They are different questions and
+                // conflating them is what put subscription work into a dollar total.
+                credential: process.env.FLEETVIEW_CREDENTIAL || "unrecorded",
+                reported_cost_usd: entry.total_cost_usd ?? entry.cost_usd ?? null,
+                input_tokens: usage.input_tokens ?? null,
+                output_tokens: usage.output_tokens ?? null,
+                cache_read_input_tokens: usage.cache_read_input_tokens ?? null,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens ?? null,
+                num_turns: entry.num_turns ?? null,
+                duration_ms: entry.duration_ms ?? null,
+                model_usage: modelUsage,
+              };
+              console.log("FLEETVIEW_USAGE_JSON=" + JSON.stringify(usageOut));
+
+              // Why a failed run failed, in the log, without dumping the conversation.
+              //
+              // The action prints a curated six-field summary of the result and hides
+              // everything else behind show_full_output, which is off because it would print
+              // the whole agent transcript into a job log. So a run that died had no reachable
+              // reason: runs 32476435986 and 32477160662 both reported is_error true, one turn,
+              // zero dollars, zero denials, and nothing anywhere said what went wrong. Two
+              // dispatches were spent guessing, and the first guess was wrong.
+              //
+              // The execution file the action leaves behind is the FULL log, not the summary,
+              // so the reason is already on the runner. This reads it out: the error text
+              // only, capped, plus the field names present on the result entry and the event
+              // types seen, so an unfamiliar shape can be diagnosed without another run.
+              const eventTypes = {};
+              for (const e of entries) {
+                const t = (e && e.type) || "unknown";
+                eventTypes[t] = (eventTypes[t] || 0) + 1;
+              }
+
+              const errText =
+                typeof entry.result === "string" ? entry.result
+                : typeof entry.error === "string" ? entry.error
+                : entry.error && typeof entry.error === "object" ? JSON.stringify(entry.error)
+                : null;
+              const errorOut = {
+                is_error: entry.is_error === true,
+                subtype: entry.subtype ?? null,
+                message: errText ? errText.slice(0, 2000) : null,
+                // Present when the failure came from the provider rather than from the agent.
+                // A run blocked by a spend limit or a bad key is not a failed task, and the two
+                // are indistinguishable without this.
+                api_error_status: entry.api_error_status ?? null,
+                stop_reason: entry.stop_reason ?? null,
+                terminal_reason: entry.terminal_reason ?? null,
+                result_keys: Object.keys(entry),
+                // Counts, not a list. This was written as one string per event, which on a
+                // DeepSeek run of 19,524 events produced a single 178 KB log line carrying four
+                // distinct values repeated nineteen thousand times. The point was to recognise
+                // an unfamiliar event shape without spending another dispatch; a tally does
+                // that, and fits on a line a human can read.
+                event_types: eventTypes,
+              };
+              console.log("FLEETVIEW_ERROR_JSON=" + JSON.stringify(errorOut));
+
+              const toolCalls = {};
+              const toolErrors = {};
+              const subagents = new Map();
+              // tool_use_id -> tool name, so an error coming back can be attributed to the tool
+              // that asked. Without this a failed run counts the ATTEMPT and reports nothing
+              // about the outcome — which is how a dispatch that made four edits, had every one
+              // of them refused, and left an empty working tree still read as "Edit x4".
+              const callNames = new Map();
+              let orchestratorTurns = 0;
+              function scanContent(content) {
+                let hasText = false;
+                for (const block of content || []) {
+                  if (block && block.type === "text" && block.text && block.text.trim()) hasText = true;
+                  if (block && block.type === "tool_use" && block.name && block.name !== "Agent") {
+                    toolCalls[block.name] = (toolCalls[block.name] || 0) + 1;
+                    if (block.id) callNames.set(block.id, block.name);
+                    hasText = true;
+                  }
+                }
+                return hasText;
+              }
+              for (const obj of entries) {
+                if (obj && obj.type === "system" && obj.subtype === "task_started" && obj.tool_use_id) {
+                  subagents.set(obj.tool_use_id, obj.description || null);
+                }
+                if (obj && obj.type === "assistant" && obj.message) {
+                  const hasText = scanContent(obj.message.content);
+                  if (hasText && !obj.parent_tool_use_id) orchestratorTurns++;
+                }
+                // A tool_use is always written before its result, so one pass is enough.
+                if (obj && obj.type === "user" && obj.message) {
+                  for (const block of obj.message.content || []) {
+                    if (block && block.type === "tool_result" && block.is_error) {
+                      const name = callNames.get(block.tool_use_id) || "unknown";
+                      toolErrors[name] = (toolErrors[name] || 0) + 1;
+                    }
+                  }
+                }
+              }
+              // Which tools were refused, by name, not just how many.
+              //
+              // The count this used to read, permission_denials_count, is NOT a field of the
+              // result entry — it is something the action computes for the six-field summary it
+              // prints. Reading it off the file gave null on every run, which the first real run
+              // to carry this code duly reported. The file has permission_denials instead, and
+              // it is an array with a tool name on each entry, which is strictly more useful:
+              // run 32475488103 refused twelve calls and the only way to learn WHICH was to
+              // spend another dispatch.
+              // Present-but-empty and absent are different facts. permission_denials is an
+              // array the CLI always writes, so an empty one means "nothing was refused" and
+              // deserves a 0; only a missing field is unknown. Reading length through a
+              // truthiness check collapsed both into null, and run 32519546293 — which really
+              // did have zero denials — reported "permissionDenials": null, indistinguishable
+              // from a run whose denials nobody could read. That is the exact confusion this
+              // field was added to end.
+              const hasDenials = Array.isArray(entry.permission_denials);
+              const denials = hasDenials ? entry.permission_denials : [];
+              const deniedTools = {};
+              const deniedDetail = [];
+              for (const d of denials) {
+                const name = (d && (d.tool_name || d.name)) || "unknown";
+                deniedTools[name] = (deniedTools[name] || 0) + 1;
+
+                // What was actually refused, not just which tool asked. The first run to get
+                // this far reported deniedTools {Bash: 2} and there was no way to learn WHICH
+                // two commands, so the scoped allowlist could not be tuned without guessing.
+                //
+                // A descriptor, never the whole input: a Bash denial is its command, a file
+                // tool is its path. Write carries the entire new contents of a file in its
+                // input, and that does not belong in a job log.
+                const input = (d && d.tool_input) || {};
+                const what = input.command || input.file_path || input.path || input.pattern || null;
+                if (what) deniedDetail.push(name + ": " + String(what).slice(0, 200));
+              }
+
+              const traceOut = {
+                durationMs: entry.duration_ms ?? null,
+                eventCount: entries.length,
+                orchestratorTurns,
+                toolCalls,
+                toolErrors,
+                // How many tools the CLI itself refused to run, reported straight through and
+                // kept apart from toolErrors, because the two disagree in a useful way: a denial
+                // blocked before dispatch may never produce a tool_result at all.
+                //
+                // Note the wording, and keep it that way. No apostrophe may appear anywhere
+                // between the quotes that open and close this script: it travels inside a
+                // single-quoted node -e, so one apostrophe ends the shell string and bash
+                // parses the rest of the program as commands. Writing the possessive form of
+                // "CLI" here took the entire step down with a syntax error near an unexpected
+                // token,
+                // losing both marker lines and the usage for every run with them. test/workflows.test.mjs
+                // now runs bash -n over every generated run: block, so this cannot ship again.
+                permissionDenials: hasDenials ? denials.length : entry.permission_denials_count ?? null,
+                deniedTools,
+                deniedDetail: deniedDetail.slice(0, 20),
+                subagents: Array.from(subagents.values()).map((description) => ({ description, durationMs: null })),
+                rawChunks: 0,
+              };
+              console.log("FLEETVIEW_TRACE_JSON=" + JSON.stringify(traceOut));
+            ' "$FILE"
+          else
+            echo "FLEETVIEW_USAGE_JSON={}"
+            echo "FLEETVIEW_TRACE_JSON={}"
+          fi
