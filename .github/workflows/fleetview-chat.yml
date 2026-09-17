@@ -1,0 +1,275 @@
+name: FleetView team chat
+
+# Provisioned by FleetView (Fase B). Live Tasks posts every chat message as an "@claude ..."
+# comment on the console's thread issue — this workflow is what answers back on that same
+# issue, so the conversation stays in one place instead of a fire-and-forget dispatch.
+#
+# Requires an ANTHROPIC_API_KEY secret on this repo (Settings → Secrets and variables →
+# Actions). Without it this workflow will fail at the Claude Code Action step.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  claude-chat:
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '@claude')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Either credential works; a repo that set only one sends the other empty.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          track_progress: true
+          claude_args: |
+            --model claude-sonnet-5
+
+      - name: Report usage
+        if: always()
+        env:
+          FLEETVIEW_CREDENTIAL: ${{ (secrets.ANTHROPIC_API_KEY != '' && secrets.CLAUDE_CODE_OAUTH_TOKEN != '') && 'unrecorded' || (secrets.ANTHROPIC_API_KEY != '' && 'api-key') || (secrets.CLAUDE_CODE_OAUTH_TOKEN != '' && 'subscription') || 'unrecorded' }}
+        run: |
+          FILE="${{ steps.claude.outputs.execution_file }}"
+          if [ -n "$FILE" ] && [ -f "$FILE" ]; then
+            node -e '
+              const fs = require("fs");
+              const path = process.argv[1];
+
+              // The CLI has written this file in two different shapes across versions: one
+              // JSON object per line, and a single pretty-printed JSON array. Handle both.
+              // Assuming JSONL is not harmless — against an array, every per-line parse fails,
+              // the whole-file fallback yields the ARRAY itself, and entry.usage is
+              // undefined, so the step reports nulls and Token usage shows "no data" for a run
+              // that cost real money. That was live behaviour until this was fixed.
+              //
+              // The newline is built with fromCharCode rather than written as an escape: this
+              // script passes through a JS template literal, then YAML, then a single-quoted
+              // shell node -e, and a backslash escape does not reliably survive all three.
+              const NL = String.fromCharCode(10);
+              let entries = [];
+              let raw = "";
+              try {
+                raw = fs.readFileSync(path, "utf8");
+              } catch (e) {
+                console.log("FLEETVIEW_USAGE_JSON={}");
+                console.log("FLEETVIEW_TRACE_JSON={}");
+                process.exit(0);
+              }
+              try {
+                const whole = JSON.parse(raw);
+                if (Array.isArray(whole)) entries = whole;
+                else if (whole && typeof whole === "object") entries = [whole];
+              } catch (e) {
+                // Not one JSON value, so treat it as JSONL and skip unparseable lines.
+                for (const line of raw.split(NL)) {
+                  if (!line.trim()) continue;
+                  try { entries.push(JSON.parse(line)); } catch (e2) { /* partial line */ }
+                }
+              }
+
+              // Scan from the end: the type:"result" entry is the last one written.
+              let entry = null;
+              for (let i = entries.length - 1; i >= 0 && !entry; i--) {
+                if (entries[i] && entries[i].type === "result") entry = entries[i];
+              }
+              if (!entry) entry = entries[entries.length - 1] || {};
+
+              const usage = entry.usage || {};
+
+              // Per-model token counts, which is what FleetView prices a run from. The CLI also
+              // prints its own total_cost_usd, carried through as reported_cost_usd — named for
+              // what it is, one claim from one provider tool, not a fact. It is only trustworthy when
+              // the CLI and the biller are the same organisation; pointed at a third-party
+              // endpoint it keeps pricing off its own table against a model name it does not
+              // know. See lib/pricing.js, which decides what FleetView is willing to claim.
+              const modelUsage = {};
+              for (const [model, raw] of Object.entries(entry.modelUsage || {})) {
+                // Guard the VALUE, not just the container. A null here threw a TypeError, the
+                // step exited non-zero under bash -e, and the whole job went red even when the
+                // agent had finished its work and opened its pull request -- taking both
+                // marker lines with it. if: always() does not save a step that throws.
+                const counts = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+                modelUsage[model] = {
+                  inputTokens: counts.inputTokens ?? null,
+                  outputTokens: counts.outputTokens ?? null,
+                  cacheReadInputTokens: counts.cacheReadInputTokens ?? null,
+                  cacheCreationInputTokens: counts.cacheCreationInputTokens ?? null,
+                };
+              }
+
+              const usageOut = {
+                provider: "anthropic",
+                // WHO SERVED IT is provider; WHO PAID is this. They are different questions and
+                // conflating them is what put subscription work into a dollar total.
+                credential: process.env.FLEETVIEW_CREDENTIAL || "unrecorded",
+                reported_cost_usd: entry.total_cost_usd ?? entry.cost_usd ?? null,
+                input_tokens: usage.input_tokens ?? null,
+                output_tokens: usage.output_tokens ?? null,
+                cache_read_input_tokens: usage.cache_read_input_tokens ?? null,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens ?? null,
+                num_turns: entry.num_turns ?? null,
+                duration_ms: entry.duration_ms ?? null,
+                model_usage: modelUsage,
+              };
+              console.log("FLEETVIEW_USAGE_JSON=" + JSON.stringify(usageOut));
+
+              // Why a failed run failed, in the log, without dumping the conversation.
+              //
+              // The action prints a curated six-field summary of the result and hides
+              // everything else behind show_full_output, which is off because it would print
+              // the whole agent transcript into a job log. So a run that died had no reachable
+              // reason: runs 32476435986 and 32477160662 both reported is_error true, one turn,
+              // zero dollars, zero denials, and nothing anywhere said what went wrong. Two
+              // dispatches were spent guessing, and the first guess was wrong.
+              //
+              // The execution file the action leaves behind is the FULL log, not the summary,
+              // so the reason is already on the runner. This reads it out: the error text
+              // only, capped, plus the field names present on the result entry and the event
+              // types seen, so an unfamiliar shape can be diagnosed without another run.
+              const eventTypes = {};
+              for (const e of entries) {
+                const t = (e && e.type) || "unknown";
+                eventTypes[t] = (eventTypes[t] || 0) + 1;
+              }
+
+              const errText =
+                typeof entry.result === "string" ? entry.result
+                : typeof entry.error === "string" ? entry.error
+                : entry.error && typeof entry.error === "object" ? JSON.stringify(entry.error)
+                : null;
+              const errorOut = {
+                is_error: entry.is_error === true,
+                subtype: entry.subtype ?? null,
+                message: errText ? errText.slice(0, 2000) : null,
+                // Present when the failure came from the provider rather than from the agent.
+                // A run blocked by a spend limit or a bad key is not a failed task, and the two
+                // are indistinguishable without this.
+                api_error_status: entry.api_error_status ?? null,
+                stop_reason: entry.stop_reason ?? null,
+                terminal_reason: entry.terminal_reason ?? null,
+                result_keys: Object.keys(entry),
+                // Counts, not a list. This was written as one string per event, which on a
+                // DeepSeek run of 19,524 events produced a single 178 KB log line carrying four
+                // distinct values repeated nineteen thousand times. The point was to recognise
+                // an unfamiliar event shape without spending another dispatch; a tally does
+                // that, and fits on a line a human can read.
+                event_types: eventTypes,
+              };
+              console.log("FLEETVIEW_ERROR_JSON=" + JSON.stringify(errorOut));
+
+              const toolCalls = {};
+              const toolErrors = {};
+              const subagents = new Map();
+              // tool_use_id -> tool name, so an error coming back can be attributed to the tool
+              // that asked. Without this a failed run counts the ATTEMPT and reports nothing
+              // about the outcome — which is how a dispatch that made four edits, had every one
+              // of them refused, and left an empty working tree still read as "Edit x4".
+              const callNames = new Map();
+              let orchestratorTurns = 0;
+              function scanContent(content) {
+                let hasText = false;
+                for (const block of content || []) {
+                  if (block && block.type === "text" && block.text && block.text.trim()) hasText = true;
+                  if (block && block.type === "tool_use" && block.name && block.name !== "Agent") {
+                    toolCalls[block.name] = (toolCalls[block.name] || 0) + 1;
+                    if (block.id) callNames.set(block.id, block.name);
+                    hasText = true;
+                  }
+                }
+                return hasText;
+              }
+              for (const obj of entries) {
+                if (obj && obj.type === "system" && obj.subtype === "task_started" && obj.tool_use_id) {
+                  subagents.set(obj.tool_use_id, obj.description || null);
+                }
+                if (obj && obj.type === "assistant" && obj.message) {
+                  const hasText = scanContent(obj.message.content);
+                  if (hasText && !obj.parent_tool_use_id) orchestratorTurns++;
+                }
+                // A tool_use is always written before its result, so one pass is enough.
+                if (obj && obj.type === "user" && obj.message) {
+                  for (const block of obj.message.content || []) {
+                    if (block && block.type === "tool_result" && block.is_error) {
+                      const name = callNames.get(block.tool_use_id) || "unknown";
+                      toolErrors[name] = (toolErrors[name] || 0) + 1;
+                    }
+                  }
+                }
+              }
+              // Which tools were refused, by name, not just how many.
+              //
+              // The count this used to read, permission_denials_count, is NOT a field of the
+              // result entry — it is something the action computes for the six-field summary it
+              // prints. Reading it off the file gave null on every run, which the first real run
+              // to carry this code duly reported. The file has permission_denials instead, and
+              // it is an array with a tool name on each entry, which is strictly more useful:
+              // run 32475488103 refused twelve calls and the only way to learn WHICH was to
+              // spend another dispatch.
+              // Present-but-empty and absent are different facts. permission_denials is an
+              // array the CLI always writes, so an empty one means "nothing was refused" and
+              // deserves a 0; only a missing field is unknown. Reading length through a
+              // truthiness check collapsed both into null, and run 32519546293 — which really
+              // did have zero denials — reported "permissionDenials": null, indistinguishable
+              // from a run whose denials nobody could read. That is the exact confusion this
+              // field was added to end.
+              const hasDenials = Array.isArray(entry.permission_denials);
+              const denials = hasDenials ? entry.permission_denials : [];
+              const deniedTools = {};
+              const deniedDetail = [];
+              for (const d of denials) {
+                const name = (d && (d.tool_name || d.name)) || "unknown";
+                deniedTools[name] = (deniedTools[name] || 0) + 1;
+
+                // What was actually refused, not just which tool asked. The first run to get
+                // this far reported deniedTools {Bash: 2} and there was no way to learn WHICH
+                // two commands, so the scoped allowlist could not be tuned without guessing.
+                //
+                // A descriptor, never the whole input: a Bash denial is its command, a file
+                // tool is its path. Write carries the entire new contents of a file in its
+                // input, and that does not belong in a job log.
+                const input = (d && d.tool_input) || {};
+                const what = input.command || input.file_path || input.path || input.pattern || null;
+                if (what) deniedDetail.push(name + ": " + String(what).slice(0, 200));
+              }
+
+              const traceOut = {
+                durationMs: entry.duration_ms ?? null,
+                eventCount: entries.length,
+                orchestratorTurns,
+                toolCalls,
+                toolErrors,
+                // How many tools the CLI itself refused to run, reported straight through and
+                // kept apart from toolErrors, because the two disagree in a useful way: a denial
+                // blocked before dispatch may never produce a tool_result at all.
+                //
+                // Note the wording, and keep it that way. No apostrophe may appear anywhere
+                // between the quotes that open and close this script: it travels inside a
+                // single-quoted node -e, so one apostrophe ends the shell string and bash
+                // parses the rest of the program as commands. Writing the possessive form of
+                // "CLI" here took the entire step down with a syntax error near an unexpected
+                // token,
+                // losing both marker lines and the usage for every run with them. test/workflows.test.mjs
+                // now runs bash -n over every generated run: block, so this cannot ship again.
+                permissionDenials: hasDenials ? denials.length : entry.permission_denials_count ?? null,
+                deniedTools,
+                deniedDetail: deniedDetail.slice(0, 20),
+                subagents: Array.from(subagents.values()).map((description) => ({ description, durationMs: null })),
+                rawChunks: 0,
+              };
+              console.log("FLEETVIEW_TRACE_JSON=" + JSON.stringify(traceOut));
+            ' "$FILE"
+          else
+            echo "FLEETVIEW_USAGE_JSON={}"
+            echo "FLEETVIEW_TRACE_JSON={}"
+          fi
